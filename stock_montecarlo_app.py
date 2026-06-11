@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-株価モンテカルロ予測アプリ(Streamlit版)
-========================================
+株価モンテカルロ予測アプリ(Streamlit版・データ取得2系統対応)
+================================================================
 銘柄コードを入力すると、過去5年分の株価を自動取得し、
 モンテカルロシミュレーションで1年後の株価分布を予測します。
 
-【事前準備(初回のみ、コマンドプロンプトで実行)】
-    pip install streamlit yfinance plotly pandas numpy
-
-【起動方法】
-    streamlit run stock_montecarlo_app.py
-    → 自動でブラウザが開きます(開かない場合は http://localhost:8501 へ)
+データ取得は2段構え:
+  1. Yahoo Finance (yfinance)  … まずこちらを試す
+  2. Stooq (stooq.com)         … Yahooがブロックされた場合の保険
 """
 
 import numpy as np
@@ -20,21 +17,18 @@ import yfinance as yf
 import plotly.graph_objects as go
 
 # ----------------------------------------------------------
-# 設定値(必要に応じて変更可能)
+# 設定値
 # ----------------------------------------------------------
 N_SIMULATIONS = 10_000   # シミュレーション回数(1万通り)
 N_DAYS = 252             # 予測日数(1年 ≒ 252営業日)
-HISTORY_PERIOD = "5y"    # 取得する過去データの期間
+HISTORY_YEARS = 5        # 取得する過去データの年数
 
-# ----------------------------------------------------------
-# ページ設定
-# ----------------------------------------------------------
 st.set_page_config(page_title="株価モンテカルロ予測", layout="wide")
 st.title("📈 株価モンテカルロ予測(1年後)")
 st.caption("過去5年の値動きパターンをもとに、1年後の株価を1万通りシミュレーションします")
 
 # ----------------------------------------------------------
-# 入力部分(画面左のサイドバー)
+# 入力部分(サイドバー)
 # ----------------------------------------------------------
 with st.sidebar:
     st.header("銘柄の指定")
@@ -59,41 +53,86 @@ with st.sidebar:
 def currency_label(ticker_code: str) -> str:
     """ティッカーから通貨表示を判定(東証・日経系は円、それ以外はドル)"""
     t = ticker_code.upper()
-    if t.endswith(".T") or t in ("^N225", "998407.O"):
+    if t.endswith(".T") or t in ("^N225",):
         return "円"
     return "ドル"
 
 
-@st.cache_data(show_spinner=False)
-def fetch_prices(ticker_code: str) -> pd.Series:
-    """過去5年分の終値を取得(同じ銘柄は再取得せずキャッシュを使う)"""
-    data = yf.download(ticker_code, period=HISTORY_PERIOD, auto_adjust=True, progress=False)
+def to_stooq_symbol(ticker_code: str) -> str:
+    """Yahoo形式のティッカーをStooq形式に変換する"""
+    t = ticker_code.upper().strip()
+    index_map = {
+        "^N225": "^NKX",   # 日経平均
+        "^IXIC": "^NDQ",   # NASDAQ総合
+        "^GSPC": "^SPX",   # S&P500
+        "^DJI": "^DJI",    # NYダウ
+    }
+    if t in index_map:
+        return index_map[t]
+    if t.endswith(".T"):              # 東証銘柄: 7203.T → 7203.JP
+        return t.replace(".T", ".JP")
+    if "." not in t and not t.startswith("^"):
+        return t + ".US"              # 米国株: AAPL → AAPL.US
+    return t
+
+
+def fetch_from_yahoo(ticker_code: str) -> pd.Series:
+    """Yahoo Financeから取得(クラウド環境ではブロックされることがある)"""
+    data = yf.download(
+        ticker_code, period=f"{HISTORY_YEARS}y",
+        auto_adjust=True, progress=False,
+    )
     if data is None or data.empty:
         return pd.Series(dtype=float)
     close = data["Close"]
-    if isinstance(close, pd.DataFrame):  # 複数列で返る場合への対応
+    if isinstance(close, pd.DataFrame):
         close = close.iloc[:, 0]
     return close.dropna()
 
 
+def fetch_from_stooq(ticker_code: str) -> pd.Series:
+    """Stooq(無料の株価データサービス)からCSVを直接取得"""
+    symbol = to_stooq_symbol(ticker_code)
+    url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i=d"
+    df = pd.read_csv(url)
+    if df.empty or "Close" not in df.columns:
+        return pd.Series(dtype=float)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    cutoff = df.index.max() - pd.DateOffset(years=HISTORY_YEARS)
+    return df.loc[df.index >= cutoff, "Close"].dropna()
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_prices(ticker_code: str):
+    """Yahoo→Stooqの順に試し、(株価データ, データ源の名前) を返す"""
+    try:
+        prices = fetch_from_yahoo(ticker_code)
+        if len(prices) > 0:
+            return prices, "Yahoo Finance"
+    except Exception:
+        pass
+    try:
+        prices = fetch_from_stooq(ticker_code)
+        if len(prices) > 0:
+            return prices, "Stooq"
+    except Exception:
+        pass
+    return pd.Series(dtype=float), None
+
+
 def run_monte_carlo(prices: pd.Series):
-    """
-    幾何ブラウン運動(GBM)によるモンテカルロシミュレーション。
-    過去の日次リターンの「平均」と「ばらつき(標準偏差)」を測り、
-    そのクセを保ったままサイコロを振って、1年分の値動きを1万通り作る。
-    """
+    """幾何ブラウン運動(GBM)によるモンテカルロシミュレーション"""
     log_returns = np.log(prices / prices.shift(1)).dropna()
     mu = log_returns.mean()      # 1日あたりの平均リターン
     sigma = log_returns.std()    # 1日あたりのばらつき(リスク)
 
     last_price = float(prices.iloc[-1])
-    rng = np.random.default_rng(seed=42)  # 再現性のため乱数を固定
+    rng = np.random.default_rng(seed=42)
 
-    # (日数 × シミュレーション数) のランダムな日次リターンを一括生成
     daily = rng.normal(mu, sigma, size=(N_DAYS, N_SIMULATIONS))
     paths = last_price * np.exp(np.cumsum(daily, axis=0))
-    paths = np.vstack([np.full(N_SIMULATIONS, last_price), paths])  # 初日=現在値
-
+    paths = np.vstack([np.full(N_SIMULATIONS, last_price), paths])
     return paths, last_price, mu, sigma
 
 
@@ -102,27 +141,31 @@ def run_monte_carlo(prices: pd.Series):
 # ----------------------------------------------------------
 if run:
     with st.spinner(f"{ticker} の株価データを取得中…"):
-        prices = fetch_prices(ticker.strip())
+        prices, source = fetch_prices(ticker.strip())
 
     if prices.empty:
-        st.error("データを取得できませんでした。銘柄コードを確認してください(例: 7203.T)。")
+        st.error(
+            "データを取得できませんでした。銘柄コードを確認してください(例: 7203.T)。"
+            "コードが正しい場合は、データ提供元が混雑している可能性があるので、"
+            "数分おいて再実行してみてください。"
+        )
         st.stop()
+
+    st.caption(f"データ取得元: {source}")
 
     if len(prices) < 250:
         st.warning("取得できたデータが1年分未満です。予測の信頼性が下がる点にご注意ください。")
 
     cur = currency_label(ticker)
     paths, last_price, mu, sigma = run_monte_carlo(prices)
-    final_prices = paths[-1]  # 1年後(252営業日後)の株価 1万通り
+    final_prices = paths[-1]
 
-    # ---- 主要な統計値 ----
-    p10 = np.percentile(final_prices, 10)    # 悲観シナリオ(下位10%)
-    p50 = np.percentile(final_prices, 50)    # 中央値
-    p90 = np.percentile(final_prices, 90)    # 楽観シナリオ(上位10%)
-    prob_up = (final_prices > last_price).mean() * 100  # 現在値を上回る確率
-    annual_vol = sigma * np.sqrt(252) * 100             # 年率ボラティリティ
+    p10 = np.percentile(final_prices, 10)
+    p50 = np.percentile(final_prices, 50)
+    p90 = np.percentile(final_prices, 90)
+    prob_up = (final_prices > last_price).mean() * 100
+    annual_vol = sigma * np.sqrt(252) * 100
 
-    # ---- サマリーカード ----
     st.subheader(f"分析結果:{ticker}")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("現在値", f"{last_price:,.0f} {cur}")
@@ -134,7 +177,6 @@ if run:
     st.divider()
     col_left, col_right = st.columns(2)
 
-    # ---- 左:過去5年+シミュレーション例 ----
     with col_left:
         st.markdown("##### 過去5年の実績と、シミュレーションの例(100本)")
         fig1 = go.Figure()
@@ -143,7 +185,7 @@ if run:
             name="過去の実績", line=dict(color="#1a2744", width=2),
         ))
         future_dates = pd.bdate_range(start=prices.index[-1], periods=N_DAYS + 1)
-        for i in range(100):  # 1万本全部描くと重いので100本だけ見せる
+        for i in range(100):
             fig1.add_trace(go.Scatter(
                 x=future_dates, y=paths[:, i],
                 line=dict(color="rgba(37,99,235,0.08)", width=1),
@@ -157,7 +199,6 @@ if run:
                            yaxis_title=f"株価({cur})", legend=dict(orientation="h"))
         st.plotly_chart(fig1, use_container_width=True)
 
-    # ---- 右:1年後の株価分布(ヒストグラム) ----
     with col_right:
         st.markdown("##### 1年後の株価はどこに落ち着きそうか(1万通りの分布)")
         fig2 = go.Figure()
@@ -177,9 +218,9 @@ if run:
                            showlegend=False)
         st.plotly_chart(fig2, use_container_width=True)
 
-    # ---- 補足情報 ----
     with st.expander("計算の前提を見る"):
         st.markdown(f"""
+        - データ取得元:{source}
         - 取得データ:過去 **{len(prices)} 営業日**({prices.index[0]:%Y/%m/%d} 〜 {prices.index[-1]:%Y/%m/%d})
         - 日次平均リターン:{mu*100:.4f}% / 年率ボラティリティ:{annual_vol:.1f}%
         - 手法:幾何ブラウン運動(GBM)。過去の値動きの「平均」と「ばらつき」が今後も続くという前提のシミュレーションです
